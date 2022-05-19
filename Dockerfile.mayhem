@@ -17,5 +17,4 @@ RUN RUSTFLAGS="-Znew-llvm-pass-manager=no" HFUZZ_RUN_ARGS="--run_time $run_time 
 FROM ubuntu:20.04
 
 COPY --from=builder /parity-bridges-common/fuzz/storage-proof/hfuzz_target/x86_64-unknown-linux-gnu/release/* /
-
-
+COPY --from=builder /parity-bridges-common/Mayhemfile /
