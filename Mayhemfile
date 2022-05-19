@@ -1,0 +1,6 @@
+project: code-terror/parity-bridges-common
+target: storage-proof-fuzzer
+
+cmds:
+  - cmd: ./storage-proof-fuzzer
+    honggfuzz: true
