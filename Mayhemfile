@@ -1,4 +1,4 @@
-project: code-terror/parity-bridges-common
+project: parity-bridges-common
 target: storage-proof-fuzzer
 
 cmds:
