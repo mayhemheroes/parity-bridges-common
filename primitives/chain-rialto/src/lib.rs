@@ -18,7 +18,9 @@
 // RuntimeApi generated functions
 #![allow(clippy::too_many_arguments)]
 
-use bp_messages::{LaneId, MessageDetails, MessageNonce};
+use bp_messages::{
+	InboundMessageDetails, LaneId, MessageNonce, MessagePayload, OutboundMessageDetails,
+};
 use bp_runtime::Chain;
 use frame_support::{
 	weights::{constants::WEIGHT_PER_SECOND, DispatchClass, IdentityFee, Weight},
@@ -27,7 +29,7 @@ use frame_support::{
 use frame_system::limits;
 use sp_core::Hasher as HasherT;
 use sp_runtime::{
-	traits::{BlakeTwo256, Convert, IdentifyAccount, Verify},
+	traits::{BlakeTwo256, IdentifyAccount, Verify},
 	FixedU128, MultiSignature, MultiSigner, Perbill,
 };
 use sp_std::prelude::*;
@@ -41,9 +43,6 @@ pub const EXTRA_STORAGE_PROOF_SIZE: u32 = 1024;
 ///
 /// Can be computed by subtracting encoded call size from raw transaction size.
 pub const TX_EXTRA_BYTES: u32 = 104;
-
-/// Maximal size (in bytes) of encoded (using `Encode::encode()`) account id.
-pub const MAXIMAL_ENCODED_ACCOUNT_ID_SIZE: u32 = 32;
 
 /// Maximal weight of single Rialto block.
 ///
@@ -182,28 +181,6 @@ impl Chain for Rialto {
 	}
 }
 
-/// Convert a 256-bit hash into an AccountId.
-pub struct AccountIdConverter;
-
-impl Convert<sp_core::H256, AccountId> for AccountIdConverter {
-	fn convert(hash: sp_core::H256) -> AccountId {
-		hash.to_fixed_bytes().into()
-	}
-}
-
-// We use this to get the account on Rialto (target) which is derived from Millau's (source)
-// account. We do this so we can fund the derived account on Rialto at Genesis to it can pay
-// transaction fees.
-//
-// The reason we can use the same `AccountId` type for both chains is because they share the same
-// development seed phrase.
-//
-// Note that this should only be used for testing.
-pub fn derive_account_from_millau_id(id: bp_runtime::SourceAccount<AccountId>) -> AccountId {
-	let encoded_id = bp_runtime::derive_account_id(bp_runtime::MILLAU_CHAIN_ID, id);
-	AccountIdConverter::convert(encoded_id)
-}
-
 frame_support::parameter_types! {
 	pub BlockLength: limits::BlockLength =
 		limits::BlockLength::max_with_normal_ratio(5 * 1024 * 1024, NORMAL_DISPATCH_RATIO);
@@ -228,6 +205,8 @@ frame_support::parameter_types! {
 pub const WITH_RIALTO_GRANDPA_PALLET_NAME: &str = "BridgeRialtoGrandpa";
 /// Name of the With-Rialto messages pallet instance that is deployed at bridged chains.
 pub const WITH_RIALTO_MESSAGES_PALLET_NAME: &str = "BridgeRialtoMessages";
+/// Name of the With-Rialto parachains bridge pallet instance that is deployed at bridged chains.
+pub const WITH_RIALTO_BRIDGE_PARAS_PALLET_NAME: &str = "BridgeRialtoParachains";
 
 /// Name of the Millau->Rialto (actually KSM->DOT) conversion rate stored in the Rialto runtime.
 pub const MILLAU_TO_RIALTO_CONVERSION_RATE_PARAMETER_NAME: &str = "MillauToRialtoConversionRate";
@@ -248,14 +227,17 @@ pub const TO_RIALTO_ESTIMATE_MESSAGE_FEE_METHOD: &str =
 /// Name of the `ToRialtoOutboundLaneApi::message_details` runtime method.
 pub const TO_RIALTO_MESSAGE_DETAILS_METHOD: &str = "ToRialtoOutboundLaneApi_message_details";
 
+/// Name of the `FromRialtoInboundLaneApi::message_details` runtime method.
+pub const FROM_RIALTO_MESSAGE_DETAILS_METHOD: &str = "FromRialtoInboundLaneApi_message_details";
+
 sp_api::decl_runtime_apis! {
 	/// API for querying information about the finalized Rialto headers.
 	///
 	/// This API is implemented by runtimes that are bridging with the Rialto chain, not the
-	/// Millau runtime itself.
+	/// Rialto runtime itself.
 	pub trait RialtoFinalityApi {
 		/// Returns number and hash of the best finalized header known to the bridge module.
-		fn best_finalized() -> (BlockNumber, Hash);
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
 	}
 
 	/// Outbound message lane API for messages that are sent to Rialto chain.
@@ -286,22 +268,21 @@ sp_api::decl_runtime_apis! {
 			lane: LaneId,
 			begin: MessageNonce,
 			end: MessageNonce,
-		) -> Vec<MessageDetails<OutboundMessageFee>>;
+		) -> Vec<OutboundMessageDetails<OutboundMessageFee>>;
 	}
-}
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use sp_runtime::codec::Encode;
-
-	#[test]
-	fn maximal_account_size_does_not_overflow_constant() {
-		assert!(
-			MAXIMAL_ENCODED_ACCOUNT_ID_SIZE as usize >= AccountId::from([0u8; 32]).encode().len(),
-			"Actual maximal size of encoded AccountId ({}) overflows expected ({})",
-			AccountId::from([0u8; 32]).encode().len(),
-			MAXIMAL_ENCODED_ACCOUNT_ID_SIZE,
-		);
+	/// Inbound message lane API for messages sent by Rialto chain.
+	///
+	/// This API is implemented by runtimes that are receiving messages from Rialto chain, not the
+	/// Rialto runtime itself.
+	///
+	/// Entries of the resulting vector are matching entries of the `messages` vector. Entries of the
+	/// `messages` vector may (and need to) be read using `To<ThisChain>OutboundLaneApi::message_details`.
+	pub trait FromRialtoInboundLaneApi<InboundMessageFee: Parameter> {
+		/// Return details of given inbound messages.
+		fn message_details(
+			lane: LaneId,
+			messages: Vec<(MessagePayload, OutboundMessageDetails<InboundMessageFee>)>,
+		) -> Vec<InboundMessageDetails>;
 	}
 }

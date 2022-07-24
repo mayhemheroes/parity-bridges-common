@@ -23,6 +23,7 @@ use bp_header_chain::{
 	justification::{verify_justification, GrandpaJustification},
 	FinalityProof,
 };
+use bp_runtime::{BasicOperatingMode, OperatingMode};
 use codec::{Decode, Encode};
 use finality_grandpa::voter_set::VoterSet;
 use num_traits::{One, Zero};
@@ -37,17 +38,19 @@ use std::marker::PhantomData;
 
 /// Finality enfine, used by the Substrate chain.
 #[async_trait]
-pub trait Engine<C: Chain> {
+pub trait Engine<C: Chain>: Send {
 	/// Unique consensus engine identifier.
 	const ID: ConsensusEngineId;
 	/// Type of finality proofs, used by consensus engine.
 	type FinalityProof: FinalityProof<BlockNumberOf<C>> + Decode + Encode;
 	/// Type of bridge pallet initialization data.
 	type InitializationData: std::fmt::Debug + Send + Sync + 'static;
+	/// Type of bridge pallet operating mode.
+	type OperatingMode: OperatingMode + 'static;
 
-	/// Returns storage key at the bridged (target) chain that corresponds to the `bool` value,
-	/// which is true when the bridge pallet is halted.
-	fn is_halted_key() -> StorageKey;
+	/// Returns storage key at the bridged (target) chain that corresponds to the variable
+	/// that holds the operating mode of the pallet.
+	fn pallet_operating_mode_key() -> StorageKey;
 	/// Returns storage at the bridged (target) chain that corresponds to some value that is
 	/// missing from the storage until bridge pallet is initialized.
 	///
@@ -59,6 +62,27 @@ pub trait Engine<C: Chain> {
 	async fn prepare_initialization_data(
 		client: Client<C>,
 	) -> Result<Self::InitializationData, Error<HashOf<C>, BlockNumberOf<C>>>;
+
+	/// Returns `Ok(true)` if finality pallet at the bridged chain has already been initialized.
+	async fn is_initialized<TargetChain: Chain>(
+		target_client: &Client<TargetChain>,
+	) -> Result<bool, SubstrateError> {
+		Ok(target_client
+			.raw_storage_value(Self::is_initialized_key(), None)
+			.await?
+			.is_some())
+	}
+
+	/// Returns `Ok(true)` if finality pallet at the bridged chain is halted.
+	async fn is_halted<TargetChain: Chain>(
+		target_client: &Client<TargetChain>,
+	) -> Result<bool, SubstrateError> {
+		Ok(target_client
+			.storage_value::<Self::OperatingMode>(Self::pallet_operating_mode_key(), None)
+			.await?
+			.map(|operating_mode| operating_mode.is_halted())
+			.unwrap_or(false))
+	}
 }
 
 /// GRANDPA finality engine.
@@ -95,13 +119,14 @@ impl<C: ChainWithGrandpa> Engine<C> for Grandpa<C> {
 	const ID: ConsensusEngineId = sp_finality_grandpa::GRANDPA_ENGINE_ID;
 	type FinalityProof = GrandpaJustification<HeaderOf<C>>;
 	type InitializationData = bp_header_chain::InitializationData<C::Header>;
+	type OperatingMode = BasicOperatingMode;
 
-	fn is_halted_key() -> StorageKey {
-		bp_header_chain::storage_keys::is_halted_key(C::WITH_CHAIN_GRANDPA_PALLET_NAME)
+	fn pallet_operating_mode_key() -> StorageKey {
+		bp_header_chain::storage_keys::pallet_operating_mode_key(C::WITH_CHAIN_GRANDPA_PALLET_NAME)
 	}
 
 	fn is_initialized_key() -> StorageKey {
-		bp_header_chain::storage_keys::best_finalized_hash_key(C::WITH_CHAIN_GRANDPA_PALLET_NAME)
+		bp_header_chain::storage_keys::best_finalized_key(C::WITH_CHAIN_GRANDPA_PALLET_NAME)
 	}
 
 	async fn finality_proofs(client: Client<C>) -> Result<Subscription<Bytes>, SubstrateError> {
@@ -220,7 +245,7 @@ impl<C: ChainWithGrandpa> Engine<C> for Grandpa<C> {
 			} else {
 				initial_authorities_set_id
 			},
-			is_halted: false,
+			operating_mode: BasicOperatingMode::Normal,
 		})
 	}
 }

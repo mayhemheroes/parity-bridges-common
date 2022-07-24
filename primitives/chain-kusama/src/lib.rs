@@ -18,7 +18,9 @@
 // RuntimeApi generated functions
 #![allow(clippy::too_many_arguments)]
 
-use bp_messages::{LaneId, MessageDetails, MessageNonce};
+use bp_messages::{
+	InboundMessageDetails, LaneId, MessageNonce, MessagePayload, OutboundMessageDetails,
+};
 use frame_support::weights::{
 	WeightToFeeCoefficient, WeightToFeeCoefficients, WeightToFeePolynomial,
 };
@@ -61,13 +63,6 @@ impl WeightToFeePolynomial for WeightToFee {
 	}
 }
 
-// We use this to get the account on Kusama (target) which is derived from Polkadot's (source)
-// account.
-pub fn derive_account_from_polkadot_id(id: bp_runtime::SourceAccount<AccountId>) -> AccountId {
-	let encoded_id = bp_runtime::derive_account_id(bp_runtime::POLKADOT_CHAIN_ID, id);
-	AccountIdConverter::convert(encoded_id)
-}
-
 /// Per-byte fee for Kusama transactions.
 pub const TRANSACTION_BYTE_FEE: Balance = 10 * 1_000_000_000_000 / 30_000 / 1_000;
 
@@ -105,6 +100,9 @@ pub const TO_KUSAMA_ESTIMATE_MESSAGE_FEE_METHOD: &str =
 /// Name of the `ToKusamaOutboundLaneApi::message_details` runtime method.
 pub const TO_KUSAMA_MESSAGE_DETAILS_METHOD: &str = "ToKusamaOutboundLaneApi_message_details";
 
+/// Name of the `FromKusamaInboundLaneApi::message_details` runtime method.
+pub const FROM_KUSAMA_MESSAGE_DETAILS_METHOD: &str = "FromKusamaInboundLaneApi_message_details";
+
 sp_api::decl_runtime_apis! {
 	/// API for querying information about the finalized Kusama headers.
 	///
@@ -112,7 +110,7 @@ sp_api::decl_runtime_apis! {
 	/// Kusama runtime itself.
 	pub trait KusamaFinalityApi {
 		/// Returns number and hash of the best finalized header known to the bridge module.
-		fn best_finalized() -> (BlockNumber, Hash);
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
 	}
 
 	/// Outbound message lane API for messages that are sent to Kusama chain.
@@ -143,6 +141,21 @@ sp_api::decl_runtime_apis! {
 			lane: LaneId,
 			begin: MessageNonce,
 			end: MessageNonce,
-		) -> Vec<MessageDetails<OutboundMessageFee>>;
+		) -> Vec<OutboundMessageDetails<OutboundMessageFee>>;
+	}
+
+	/// Inbound message lane API for messages sent by Kusama chain.
+	///
+	/// This API is implemented by runtimes that are receiving messages from Kusama chain, not the
+	/// Kusama runtime itself.
+	///
+	/// Entries of the resulting vector are matching entries of the `messages` vector. Entries of the
+	/// `messages` vector may (and need to) be read using `To<ThisChain>OutboundLaneApi::message_details`.
+	pub trait FromKusamaInboundLaneApi<InboundMessageFee: Parameter> {
+		/// Return details of given inbound messages.
+		fn message_details(
+			lane: LaneId,
+			messages: Vec<(MessagePayload, OutboundMessageDetails<InboundMessageFee>)>,
+		) -> Vec<InboundMessageDetails>;
 	}
 }

@@ -25,13 +25,14 @@ use bp_messages::{
 	target_chain::{DispatchMessage, MessageDispatch, ProvedLaneMessages, ProvedMessages},
 	InboundLaneData, LaneId, Message, MessageData, MessageKey, MessageNonce, OutboundLaneData,
 };
+use bp_polkadot_core::parachains::{ParaHash, ParaHasher, ParaId};
 use bp_runtime::{messages::MessageDispatchResult, ChainId, Size, StorageProofChecker};
-use codec::{Decode, DecodeLimit, Encode};
+use codec::{Decode, DecodeLimit, Encode, MaxEncodedLen};
 use frame_support::{traits::Get, weights::Weight, RuntimeDebug};
 use hash_db::Hasher;
 use scale_info::TypeInfo;
 use sp_runtime::{
-	traits::{AtLeast32BitUnsigned, CheckedAdd, CheckedDiv, CheckedMul},
+	traits::{AtLeast32BitUnsigned, CheckedAdd, CheckedDiv, CheckedMul, Header as HeaderT},
 	FixedPointNumber, FixedPointOperand, FixedU128,
 };
 use sp_std::{cmp::PartialOrd, convert::TryFrom, fmt::Debug, marker::PhantomData, vec::Vec};
@@ -68,7 +69,7 @@ pub trait ChainWithMessages {
 	/// Hash used in the chain.
 	type Hash: Decode;
 	/// Accound id on the chain.
-	type AccountId: Encode + Decode;
+	type AccountId: Encode + Decode + MaxEncodedLen;
 	/// Public key of the chain account that may be used to verify signatures.
 	type Signer: Encode + Decode;
 	/// Signature type used on the chain.
@@ -98,12 +99,54 @@ pub struct MessageTransaction<Weight> {
 	pub size: u32,
 }
 
+/// Helper trait for estimating the size and weight of a single message delivery confirmation
+/// transaction.
+pub trait ConfirmationTransactionEstimation<Weight> {
+	// Estimate size and weight of single message delivery confirmation transaction.
+	fn estimate_delivery_confirmation_transaction() -> MessageTransaction<Weight>;
+}
+
+/// Default implementation for `ConfirmationTransactionEstimation`.
+pub struct BasicConfirmationTransactionEstimation<
+	AccountId: MaxEncodedLen,
+	const MAX_CONFIRMATION_TX_WEIGHT: Weight,
+	const EXTRA_STORAGE_PROOF_SIZE: u32,
+	const TX_EXTRA_BYTES: u32,
+>(PhantomData<AccountId>);
+
+impl<
+		AccountId: MaxEncodedLen,
+		const MAX_CONFIRMATION_TX_WEIGHT: Weight,
+		const EXTRA_STORAGE_PROOF_SIZE: u32,
+		const TX_EXTRA_BYTES: u32,
+	> ConfirmationTransactionEstimation<Weight>
+	for BasicConfirmationTransactionEstimation<
+		AccountId,
+		MAX_CONFIRMATION_TX_WEIGHT,
+		EXTRA_STORAGE_PROOF_SIZE,
+		TX_EXTRA_BYTES,
+	>
+{
+	fn estimate_delivery_confirmation_transaction() -> MessageTransaction<Weight> {
+		let inbound_data_size = InboundLaneData::<AccountId>::encoded_size_hint_u32(1, 1);
+		MessageTransaction {
+			dispatch_weight: MAX_CONFIRMATION_TX_WEIGHT,
+			size: inbound_data_size
+				.saturating_add(EXTRA_STORAGE_PROOF_SIZE)
+				.saturating_add(TX_EXTRA_BYTES),
+		}
+	}
+}
+
 /// This chain that has `pallet-bridge-messages` and `dispatch` modules.
 pub trait ThisChainWithMessages: ChainWithMessages {
 	/// Call origin on the chain.
 	type Origin;
 	/// Call type on the chain.
 	type Call: Encode + Decode;
+	/// Helper for estimating the size and weight of a single message delivery confirmation
+	/// transaction at this chain.
+	type ConfirmationTransactionEstimation: ConfirmationTransactionEstimation<WeightOf<Self>>;
 
 	/// Do we accept message sent by given origin to given lane?
 	fn is_message_accepted(origin: &Self::Origin, lane: &LaneId) -> bool;
@@ -114,7 +157,9 @@ pub trait ThisChainWithMessages: ChainWithMessages {
 	fn maximal_pending_messages_at_outbound_lane() -> MessageNonce;
 
 	/// Estimate size and weight of single message delivery confirmation transaction at This chain.
-	fn estimate_delivery_confirmation_transaction() -> MessageTransaction<WeightOf<Self>>;
+	fn estimate_delivery_confirmation_transaction() -> MessageTransaction<WeightOf<Self>> {
+		Self::ConfirmationTransactionEstimation::estimate_delivery_confirmation_transaction()
+	}
 
 	/// Returns minimal transaction fee that must be paid for given transaction at This chain.
 	fn transaction_payment(transaction: MessageTransaction<WeightOf<Self>>) -> BalanceOf<Self>;
@@ -196,11 +241,17 @@ pub fn transaction_payment<Balance: AtLeast32BitUnsigned + FixedPointOperand>(
 pub mod source {
 	use super::*;
 
-	/// Encoded Call of the Bridged chain. We never try to decode it on This chain.
-	pub type BridgedChainOpaqueCall = Vec<u8>;
-
 	/// Message payload for This -> Bridged chain messages.
 	pub type FromThisChainMessagePayload = Vec<u8>;
+
+	/// Maximal size of outbound message payload.
+	pub struct FromThisChainMaximalOutboundPayloadSize<B>(PhantomData<B>);
+
+	impl<B: MessageBridge> Get<u32> for FromThisChainMaximalOutboundPayloadSize<B> {
+		fn get() -> u32 {
+			maximal_message_size::<B>()
+		}
+	}
 
 	/// Messages delivery proof from bridged chain:
 	///
@@ -218,7 +269,7 @@ pub mod source {
 	}
 
 	impl<BridgedHeaderHash> Size for FromBridgedChainMessagesDeliveryProof<BridgedHeaderHash> {
-		fn size_hint(&self) -> u32 {
+		fn size(&self) -> u32 {
 			u32::try_from(
 				self.storage_proof
 					.iter()
@@ -390,6 +441,9 @@ pub mod source {
 	}
 
 	/// Verify proof of This -> Bridged chain messages delivery.
+	///
+	/// This function is used when Bridged chain is directly using GRANDPA finality. For Bridged
+	/// parachains, please use the `verify_messages_delivery_proof_from_parachain`.
 	pub fn verify_messages_delivery_proof<B: MessageBridge, ThisRuntime, GrandpaInstance: 'static>(
 		proof: FromBridgedChainMessagesDeliveryProof<HashOf<BridgedChain<B>>>,
 	) -> Result<ParsedMessagesDeliveryProofFromBridgedChain<B>, &'static str>
@@ -406,22 +460,69 @@ pub mod source {
 		pallet_bridge_grandpa::Pallet::<ThisRuntime, GrandpaInstance>::parse_finalized_storage_proof(
 			bridged_header_hash.into(),
 			StorageProof::new(storage_proof),
-			|storage| {
-				// Messages delivery proof is just proof of single storage key read => any error
-				// is fatal.
-				let storage_inbound_lane_data_key =
-					bp_messages::storage_keys::inbound_lane_data_key(B::BRIDGED_MESSAGES_PALLET_NAME, &lane);
-				let raw_inbound_lane_data = storage
-					.read_value(storage_inbound_lane_data_key.0.as_ref())
-					.map_err(|_| "Failed to read inbound lane state from storage proof")?
-					.ok_or("Inbound lane state is missing from the messages proof")?;
-				let inbound_lane_data = InboundLaneData::decode(&mut &raw_inbound_lane_data[..])
-					.map_err(|_| "Failed to decode inbound lane state from the proof")?;
-
-				Ok((lane, inbound_lane_data))
-			},
+			|storage| do_verify_messages_delivery_proof::<
+				B,
+				bp_runtime::HasherOf<
+					<ThisRuntime as pallet_bridge_grandpa::Config<GrandpaInstance>>::BridgedChain,
+				>,
+			>(lane, storage),
 		)
 		.map_err(<&'static str>::from)?
+	}
+
+	/// Verify proof of This -> Bridged chain messages delivery.
+	///
+	/// This function is used when Bridged chain is using parachain finality. For Bridged
+	/// chains with direct GRANDPA finality, please use the `verify_messages_delivery_proof`.
+	///
+	/// This function currently only supports parachains, which are using header type that
+	/// implements `sp_runtime::traits::Header` trait.
+	pub fn verify_messages_delivery_proof_from_parachain<
+		B,
+		BridgedHeader,
+		ThisRuntime,
+		ParachainsInstance: 'static,
+	>(
+		bridged_parachain: ParaId,
+		proof: FromBridgedChainMessagesDeliveryProof<HashOf<BridgedChain<B>>>,
+	) -> Result<ParsedMessagesDeliveryProofFromBridgedChain<B>, &'static str>
+	where
+		B: MessageBridge,
+		B::BridgedChain: ChainWithMessages<Hash = ParaHash>,
+		BridgedHeader: HeaderT<Hash = HashOf<BridgedChain<B>>>,
+		ThisRuntime: pallet_bridge_parachains::Config<ParachainsInstance>,
+	{
+		let FromBridgedChainMessagesDeliveryProof { bridged_header_hash, storage_proof, lane } =
+			proof;
+		pallet_bridge_parachains::Pallet::<ThisRuntime, ParachainsInstance>::parse_finalized_storage_proof(
+			bridged_parachain,
+			bridged_header_hash,
+			StorageProof::new(storage_proof),
+			|para_head| BridgedHeader::decode(&mut &para_head.0[..]).ok().map(|h| *h.state_root()),
+			|storage| do_verify_messages_delivery_proof::<B, ParaHasher>(lane, storage),
+		)
+		.map_err(<&'static str>::from)?
+	}
+
+	/// The essense of This -> Bridged chain messages delivery proof verification.
+	fn do_verify_messages_delivery_proof<B: MessageBridge, H: Hasher>(
+		lane: LaneId,
+		storage: bp_runtime::StorageProofChecker<H>,
+	) -> Result<ParsedMessagesDeliveryProofFromBridgedChain<B>, &'static str> {
+		// Messages delivery proof is just proof of single storage key read => any error
+		// is fatal.
+		let storage_inbound_lane_data_key = bp_messages::storage_keys::inbound_lane_data_key(
+			B::BRIDGED_MESSAGES_PALLET_NAME,
+			&lane,
+		);
+		let raw_inbound_lane_data = storage
+			.read_value(storage_inbound_lane_data_key.0.as_ref())
+			.map_err(|_| "Failed to read inbound lane state from storage proof")?
+			.ok_or("Inbound lane state is missing from the messages proof")?;
+		let inbound_lane_data = InboundLaneData::decode(&mut &raw_inbound_lane_data[..])
+			.map_err(|_| "Failed to decode inbound lane state from the proof")?;
+
+		Ok((lane, inbound_lane_data))
 	}
 }
 
@@ -430,7 +531,7 @@ pub mod target {
 	use super::*;
 
 	/// Decoded Bridged -> This message payload.
-	#[derive(RuntimeDebug, PartialEq)]
+	#[derive(RuntimeDebug, PartialEq, Eq)]
 	pub struct FromBridgedChainMessagePayload<Call> {
 		/// Data that is actually sent over the wire.
 		pub xcm: (xcm::v3::MultiLocation, xcm::v3::Xcm<Call>),
@@ -472,6 +573,7 @@ pub mod target {
 		pub bridged_header_hash: BridgedHeaderHash,
 		/// A storage trie proof of messages being delivered.
 		pub storage_proof: RawStorageProof,
+		/// Messages in this proof are sent over this lane.
 		pub lane: LaneId,
 		/// Nonce of the first message being delivered.
 		pub nonces_start: MessageNonce,
@@ -480,7 +582,7 @@ pub mod target {
 	}
 
 	impl<BridgedHeaderHash> Size for FromBridgedChainMessagesProof<BridgedHeaderHash> {
-		fn size_hint(&self) -> u32 {
+		fn size(&self) -> u32 {
 			u32::try_from(
 				self.storage_proof
 					.iter()
@@ -590,6 +692,9 @@ pub mod target {
 
 	/// Verify proof of Bridged -> This chain messages.
 	///
+	/// This function is used when Bridged chain is directly using GRANDPA finality. For Bridged
+	/// parachains, please use the `verify_messages_proof_from_parachain`.
+	///
 	/// The `messages_count` argument verification (sane limits) is supposed to be made
 	/// outside of this function. This function only verifies that the proof declares exactly
 	/// `messages_count` messages.
@@ -624,7 +729,55 @@ pub mod target {
 		.map_err(Into::into)
 	}
 
-	#[derive(Debug, PartialEq)]
+	/// Verify proof of Bridged -> This chain messages.
+	///
+	/// This function is used when Bridged chain is using parachain finality. For Bridged
+	/// chains with direct GRANDPA finality, please use the `verify_messages_proof`.
+	///
+	/// The `messages_count` argument verification (sane limits) is supposed to be made
+	/// outside of this function. This function only verifies that the proof declares exactly
+	/// `messages_count` messages.
+	///
+	/// This function currently only supports parachains, which are using header type that
+	/// implements `sp_runtime::traits::Header` trait.
+	pub fn verify_messages_proof_from_parachain<
+		B,
+		BridgedHeader,
+		ThisRuntime,
+		ParachainsInstance: 'static,
+	>(
+		bridged_parachain: ParaId,
+		proof: FromBridgedChainMessagesProof<HashOf<BridgedChain<B>>>,
+		messages_count: u32,
+	) -> Result<ProvedMessages<Message<BalanceOf<BridgedChain<B>>>>, &'static str>
+	where
+		B: MessageBridge,
+		B::BridgedChain: ChainWithMessages<Hash = ParaHash>,
+		BridgedHeader: HeaderT<Hash = HashOf<BridgedChain<B>>>,
+		ThisRuntime: pallet_bridge_parachains::Config<ParachainsInstance>,
+	{
+		verify_messages_proof_with_parser::<B, _, _>(
+			proof,
+			messages_count,
+			|bridged_header_hash, bridged_storage_proof| {
+				pallet_bridge_parachains::Pallet::<ThisRuntime, ParachainsInstance>::parse_finalized_storage_proof(
+					bridged_parachain,
+					bridged_header_hash,
+					StorageProof::new(bridged_storage_proof),
+					|para_head| BridgedHeader::decode(&mut &para_head.0[..]).ok().map(|h| *h.state_root()),
+					|storage_adapter| storage_adapter,
+				)
+				.map(|storage| StorageProofCheckerAdapter::<_, B> {
+					storage,
+					_dummy: Default::default(),
+				})
+				.map_err(|err| MessageProofError::Custom(err.into()))
+			},
+		)
+		.map_err(Into::into)
+	}
+
+	#[derive(Debug, PartialEq, Eq)]
 	pub(crate) enum MessageProofError {
 		Empty,
 		MessagesCountMismatch,
@@ -751,7 +904,7 @@ pub mod target {
 			return Err(MessageProofError::Empty)
 		}
 
-		// We only support single lane messages in this schema
+		// We only support single lane messages in this generated_schema
 		let mut proved_messages = ProvedMessages::new();
 		proved_messages.insert(lane, proved_lane_messages);
 
@@ -842,7 +995,7 @@ pub mod xcm_copy {
 			message: &mut Option<Xcm<()>>,
 		) -> Result<((Vec<u8>, XcmHash), MultiAssets), SendError> {
 			let bridged_network = BridgedNetwork::get();
-			ensure!(&network == &bridged_network, SendError::NotApplicable);
+			ensure!(network == bridged_network, SendError::NotApplicable);
 			// We don't/can't use the `channel` for this adapter.
 			let dest = destination.take().ok_or(SendError::MissingArgument)?;
 			let universal_dest = match dest.pushed_front_with(GlobalConsensus(bridged_network)) {
@@ -928,13 +1081,13 @@ mod tests {
 		}
 	}
 
-	#[derive(Debug, PartialEq, Decode, Encode, Clone)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode, Clone, MaxEncodedLen)]
 	struct ThisChainAccountId(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	struct ThisChainSigner(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	struct ThisChainSignature(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	enum ThisChainCall {
 		#[codec(index = 42)]
 		Transfer,
@@ -954,13 +1107,13 @@ mod tests {
 		}
 	}
 
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode, MaxEncodedLen)]
 	struct BridgedChainAccountId(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	struct BridgedChainSigner(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	struct BridgedChainSignature(u32);
-	#[derive(Debug, PartialEq, Decode, Encode)]
+	#[derive(Debug, PartialEq, Eq, Decode, Encode)]
 	enum BridgedChainCall {}
 	#[derive(Clone, Debug)]
 	struct BridgedChainOrigin;
@@ -977,7 +1130,7 @@ mod tests {
 
 	macro_rules! impl_wrapped_balance {
 		($name:ident) => {
-			#[derive(Debug, PartialEq, Decode, Encode, Clone, Copy)]
+			#[derive(Debug, PartialEq, Eq, Decode, Encode, Clone, Copy)]
 			struct $name(u32);
 
 			impl From<u32> for $name {
@@ -1053,6 +1206,12 @@ mod tests {
 	impl ThisChainWithMessages for ThisChain {
 		type Origin = ThisChainOrigin;
 		type Call = ThisChainCall;
+		type ConfirmationTransactionEstimation = BasicConfirmationTransactionEstimation<
+			<ThisChain as ChainWithMessages>::AccountId,
+			{ DELIVERY_CONFIRMATION_TRANSACTION_WEIGHT },
+			0,
+			0,
+		>;
 
 		fn is_message_accepted(_send_origin: &Self::Origin, lane: &LaneId) -> bool {
 			lane == TEST_LANE_ID
@@ -1060,13 +1219,6 @@ mod tests {
 
 		fn maximal_pending_messages_at_outbound_lane() -> MessageNonce {
 			MAXIMAL_PENDING_MESSAGES_AT_TEST_LANE
-		}
-
-		fn estimate_delivery_confirmation_transaction() -> MessageTransaction<WeightOf<Self>> {
-			MessageTransaction {
-				dispatch_weight: DELIVERY_CONFIRMATION_TRANSACTION_WEIGHT,
-				size: 0,
-			}
 		}
 
 		fn transaction_payment(transaction: MessageTransaction<WeightOf<Self>>) -> BalanceOf<Self> {
@@ -1114,16 +1266,18 @@ mod tests {
 	impl ThisChainWithMessages for BridgedChain {
 		type Origin = BridgedChainOrigin;
 		type Call = BridgedChainCall;
+		type ConfirmationTransactionEstimation = BasicConfirmationTransactionEstimation<
+			<BridgedChain as ChainWithMessages>::AccountId,
+			0,
+			0,
+			0,
+		>;
 
 		fn is_message_accepted(_send_origin: &Self::Origin, _lane: &LaneId) -> bool {
 			unreachable!()
 		}
 
 		fn maximal_pending_messages_at_outbound_lane() -> MessageNonce {
-			unreachable!()
-		}
-
-		fn estimate_delivery_confirmation_transaction() -> MessageTransaction<WeightOf<Self>> {
 			unreachable!()
 		}
 

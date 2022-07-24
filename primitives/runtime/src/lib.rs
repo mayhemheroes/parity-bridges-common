@@ -18,18 +18,26 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use codec::Encode;
-use frame_support::{RuntimeDebug, StorageHasher};
+use codec::{Decode, Encode, FullCodec, MaxEncodedLen};
+use frame_support::{
+	log, pallet_prelude::DispatchResult, PalletError, RuntimeDebug, StorageHasher, StorageValue,
+};
+use frame_system::RawOrigin;
+use scale_info::TypeInfo;
 use sp_core::{hash::H256, storage::StorageKey};
 use sp_io::hashing::blake2_256;
-use sp_std::{convert::TryFrom, vec, vec::Vec};
+use sp_runtime::traits::{BadOrigin, Header as HeaderT};
+use sp_std::{convert::TryFrom, fmt::Debug, vec, vec::Vec};
 
 pub use chain::{
 	AccountIdOf, AccountPublicOf, BalanceOf, BlockNumberOf, Chain, EncodedOrDecodedCall, HashOf,
 	HasherOf, HeaderOf, IndexOf, SignatureOf, TransactionEraOf,
 };
 pub use frame_support::storage::storage_prefix as storage_value_final_key;
-pub use storage_proof::{Error as StorageProofError, StorageProofChecker};
+use num_traits::{CheckedSub, One};
+pub use storage_proof::{
+	Error as StorageProofError, ProofSize as StorageProofSize, StorageProofChecker,
+};
 
 #[cfg(feature = "std")]
 pub use storage_proof::craft_valid_storage_proof;
@@ -44,6 +52,9 @@ pub const NO_INSTANCE_ID: ChainId = [0, 0, 0, 0];
 
 /// Bridge-with-Rialto instance id.
 pub const RIALTO_CHAIN_ID: ChainId = *b"rlto";
+
+/// Bridge-with-RialtoParachain instance id.
+pub const RIALTO_PARACHAIN_CHAIN_ID: ChainId = *b"rlpa";
 
 /// Bridge-with-Millau instance id.
 pub const MILLAU_CHAIN_ID: ChainId = *b"mlau";
@@ -72,6 +83,27 @@ pub const ROOT_ACCOUNT_DERIVATION_PREFIX: &[u8] = b"pallet-bridge/account-deriva
 /// Generic header Id.
 #[derive(RuntimeDebug, Default, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct HeaderId<Hash, Number>(pub Number, pub Hash);
+
+/// Generic header id provider.
+pub trait HeaderIdProvider<Header: HeaderT> {
+	// Get the header id.
+	fn id(&self) -> HeaderId<Header::Hash, Header::Number>;
+
+	// Get the header id for the parent block.
+	fn parent_id(&self) -> Option<HeaderId<Header::Hash, Header::Number>>;
+}
+
+impl<Header: HeaderT> HeaderIdProvider<Header> for Header {
+	fn id(&self) -> HeaderId<Header::Hash, Header::Number> {
+		HeaderId(*self.number(), self.hash())
+	}
+
+	fn parent_id(&self) -> Option<HeaderId<Header::Hash, Header::Number>> {
+		self.number()
+			.checked_sub(&One::one())
+			.map(|parent_number| HeaderId(parent_number, *self.parent_hash()))
+	}
+}
 
 /// Unique identifier of the chain.
 ///
@@ -117,33 +149,20 @@ where
 	.into()
 }
 
-/// Derive the account ID of the shared relayer fund account.
-///
-/// This account is used to collect fees for relayers that are passing messages across the bridge.
-///
-/// The account ID can be the same across different instances of `pallet-bridge-messages` if the
-/// same `bridge_id` is used.
-pub fn derive_relayer_fund_account_id(bridge_id: ChainId) -> H256 {
-	("relayer-fund-account", bridge_id).using_encoded(blake2_256).into()
-}
-
 /// Anything that has size.
 pub trait Size {
-	/// Return approximate size of this object (in bytes).
-	///
-	/// This function should be lightweight. The result should not necessary be absolutely
-	/// accurate.
-	fn size_hint(&self) -> u32;
+	/// Return size of this object (in bytes).
+	fn size(&self) -> u32;
 }
 
 impl Size for () {
-	fn size_hint(&self) -> u32 {
+	fn size(&self) -> u32 {
 		0
 	}
 }
 
 impl Size for Vec<u8> {
-	fn size_hint(&self) -> u32 {
+	fn size(&self) -> u32 {
 		self.len() as _
 	}
 }
@@ -152,7 +171,7 @@ impl Size for Vec<u8> {
 pub struct PreComputedSize(pub usize);
 
 impl Size for PreComputedSize {
-	fn size_hint(&self) -> u32 {
+	fn size(&self) -> u32 {
 		u32::try_from(self.0).unwrap_or(u32::MAX)
 	}
 }
@@ -226,6 +245,38 @@ pub fn storage_map_final_key<H: StorageHasher>(
 	StorageKey(final_key)
 }
 
+/// This is a copy of the
+/// `frame_support::storage::generator::StorageDoubleMap::storage_double_map_final_key` for maps
+/// based on selected hashers.
+///
+/// We're using it because to call `storage_double_map_final_key` directly, we need access to the
+/// runtime and pallet instance, which (sometimes) is impossible.
+pub fn storage_double_map_final_key<H1: StorageHasher, H2: StorageHasher>(
+	pallet_prefix: &str,
+	map_name: &str,
+	key1: &[u8],
+	key2: &[u8],
+) -> StorageKey {
+	let key1_hashed = H1::hash(key1);
+	let key2_hashed = H2::hash(key2);
+	let pallet_prefix_hashed = frame_support::Twox128::hash(pallet_prefix.as_bytes());
+	let storage_prefix_hashed = frame_support::Twox128::hash(map_name.as_bytes());
+
+	let mut final_key = Vec::with_capacity(
+		pallet_prefix_hashed.len() +
+			storage_prefix_hashed.len() +
+			key1_hashed.as_ref().len() +
+			key2_hashed.as_ref().len(),
+	);
+
+	final_key.extend_from_slice(&pallet_prefix_hashed[..]);
+	final_key.extend_from_slice(&storage_prefix_hashed[..]);
+	final_key.extend_from_slice(key1_hashed.as_ref());
+	final_key.extend_from_slice(key2_hashed.as_ref());
+
+	StorageKey(final_key)
+}
+
 /// This is how a storage key of storage parameter (`parameter_types! { storage Param: bool = false;
 /// }`) is computed.
 ///
@@ -250,6 +301,103 @@ pub fn storage_value_key(pallet_prefix: &str, value_name: &str) -> StorageKey {
 	final_key[16..].copy_from_slice(&storage_hash);
 
 	StorageKey(final_key)
+}
+
+/// Error generated by the `OwnedBridgeModule` trait.
+#[derive(Encode, Decode, TypeInfo, PalletError)]
+pub enum OwnedBridgeModuleError {
+	/// All pallet operations are halted.
+	Halted,
+}
+
+/// Operating mode for a bridge module.
+pub trait OperatingMode: Send + Copy + Debug + FullCodec {
+	// Returns true if the bridge module is halted.
+	fn is_halted(&self) -> bool;
+}
+
+/// Basic operating modes for a bridges module (Normal/Halted).
+#[derive(Encode, Decode, Clone, Copy, PartialEq, Eq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]
+pub enum BasicOperatingMode {
+	/// Normal mode, when all operations are allowed.
+	Normal,
+	/// The pallet is halted. All operations (except operating mode change) are prohibited.
+	Halted,
+}
+
+impl Default for BasicOperatingMode {
+	fn default() -> Self {
+		Self::Normal
+	}
+}
+
+impl OperatingMode for BasicOperatingMode {
+	fn is_halted(&self) -> bool {
+		*self == BasicOperatingMode::Halted
+	}
+}
+
+/// Bridge module that has owner and operating mode
+pub trait OwnedBridgeModule<T: frame_system::Config> {
+	/// The target that will be used when publishing logs related to this module.
+	const LOG_TARGET: &'static str;
+
+	type OwnerStorage: StorageValue<T::AccountId, Query = Option<T::AccountId>>;
+	type OperatingMode: OperatingMode;
+	type OperatingModeStorage: StorageValue<Self::OperatingMode, Query = Self::OperatingMode>;
+
+	/// Check if the module is halted.
+	fn is_halted() -> bool {
+		Self::OperatingModeStorage::get().is_halted()
+	}
+
+	/// Ensure that the origin is either root, or `PalletOwner`.
+	fn ensure_owner_or_root(origin: T::Origin) -> Result<(), BadOrigin> {
+		match origin.into() {
+			Ok(RawOrigin::Root) => Ok(()),
+			Ok(RawOrigin::Signed(ref signer))
+				if Self::OwnerStorage::get().as_ref() == Some(signer) =>
+				Ok(()),
+			_ => Err(BadOrigin),
+		}
+	}
+
+	/// Ensure that the module is not halted.
+	fn ensure_not_halted() -> Result<(), OwnedBridgeModuleError> {
+		match Self::is_halted() {
+			true => Err(OwnedBridgeModuleError::Halted),
+			false => Ok(()),
+		}
+	}
+
+	/// Change the owner of the module.
+	fn set_owner(origin: T::Origin, maybe_owner: Option<T::AccountId>) -> DispatchResult {
+		Self::ensure_owner_or_root(origin)?;
+		match maybe_owner {
+			Some(owner) => {
+				Self::OwnerStorage::put(&owner);
+				log::info!(target: Self::LOG_TARGET, "Setting pallet Owner to: {:?}", owner);
+			},
+			None => {
+				Self::OwnerStorage::kill();
+				log::info!(target: Self::LOG_TARGET, "Removed Owner of pallet.");
+			},
+		}
+
+		Ok(())
+	}
+
+	/// Halt or resume all/some module operations.
+	fn set_operating_mode(
+		origin: T::Origin,
+		operating_mode: Self::OperatingMode,
+	) -> DispatchResult {
+		Self::ensure_owner_or_root(origin)?;
+		Self::OperatingModeStorage::put(operating_mode);
+		log::info!(target: Self::LOG_TARGET, "Setting operating mode to {:?}.", operating_mode);
+		Ok(())
+	}
 }
 
 #[cfg(test)]

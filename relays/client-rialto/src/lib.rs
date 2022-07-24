@@ -21,7 +21,8 @@ use codec::{Compact, Decode, Encode};
 use frame_support::weights::Weight;
 use relay_substrate_client::{
 	BalanceOf, Chain, ChainBase, ChainWithBalances, ChainWithGrandpa, ChainWithMessages,
-	Error as SubstrateError, IndexOf, SignParam, TransactionSignScheme, UnsignedTransaction,
+	Error as SubstrateError, IndexOf, RelayChain, SignParam, TransactionSignScheme,
+	UnsignedTransaction,
 };
 use sp_core::{storage::StorageKey, Pair};
 use sp_runtime::{generic::SignedPayload, traits::IdentifyAccount};
@@ -31,7 +32,7 @@ use std::time::Duration;
 pub type HeaderId = relay_utils::HeaderId<rialto_runtime::Hash, rialto_runtime::BlockNumber>;
 
 /// Rialto chain definition
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rialto;
 
 impl ChainBase for Rialto {
@@ -62,11 +63,16 @@ impl Chain for Rialto {
 		bp_rialto::BEST_FINALIZED_RIALTO_HEADER_METHOD;
 	const AVERAGE_BLOCK_INTERVAL: Duration = Duration::from_secs(5);
 	const STORAGE_PROOF_OVERHEAD: u32 = bp_rialto::EXTRA_STORAGE_PROOF_SIZE;
-	const MAXIMAL_ENCODED_ACCOUNT_ID_SIZE: u32 = bp_rialto::MAXIMAL_ENCODED_ACCOUNT_ID_SIZE;
 
 	type SignedBlock = rialto_runtime::SignedBlock;
 	type Call = rialto_runtime::Call;
 	type WeightToFee = bp_rialto::WeightToFee;
+}
+
+impl RelayChain for Rialto {
+	const PARAS_PALLET_NAME: &'static str = bp_rialto::PARAS_PALLET_NAME;
+	const PARACHAINS_FINALITY_PALLET_NAME: &'static str =
+		bp_rialto::WITH_RIALTO_BRIDGE_PARAS_PALLET_NAME;
 }
 
 impl ChainWithGrandpa for Rialto {
@@ -78,6 +84,8 @@ impl ChainWithMessages for Rialto {
 		bp_rialto::WITH_RIALTO_MESSAGES_PALLET_NAME;
 	const TO_CHAIN_MESSAGE_DETAILS_METHOD: &'static str =
 		bp_rialto::TO_RIALTO_MESSAGE_DETAILS_METHOD;
+	const FROM_CHAIN_MESSAGE_DETAILS_METHOD: &'static str =
+		bp_rialto::FROM_RIALTO_MESSAGE_DETAILS_METHOD;
 	const PAY_INBOUND_DISPATCH_FEE_WEIGHT_AT_CHAIN: Weight =
 		bp_rialto::PAY_INBOUND_DISPATCH_FEE_WEIGHT;
 	const MAX_UNREWARDED_RELAYERS_IN_CONFIRMATION_TX: MessageNonce =

@@ -18,7 +18,9 @@
 // RuntimeApi generated functions
 #![allow(clippy::too_many_arguments)]
 
-use bp_messages::{LaneId, MessageDetails, MessageNonce};
+use bp_messages::{
+	InboundMessageDetails, LaneId, MessageNonce, MessagePayload, OutboundMessageDetails,
+};
 use frame_support::weights::{
 	Weight, WeightToFeeCoefficient, WeightToFeeCoefficients, WeightToFeePolynomial,
 };
@@ -67,13 +69,6 @@ impl WeightToFeePolynomial for WeightToFee {
 	}
 }
 
-// We use this to get the account on Rococo (target) which is derived from Wococo's (source)
-// account.
-pub fn derive_account_from_wococo_id(id: bp_runtime::SourceAccount<AccountId>) -> AccountId {
-	let encoded_id = bp_runtime::derive_account_id(bp_runtime::WOCOCO_CHAIN_ID, id);
-	AccountIdConverter::convert(encoded_id)
-}
-
 /// Name of the With-Rococo GRANDPA pallet instance that is deployed at bridged chains.
 pub const WITH_ROCOCO_GRANDPA_PALLET_NAME: &str = "BridgeRococoGrandpa";
 /// Name of the With-Rococo messages pallet instance that is deployed at bridged chains.
@@ -88,6 +83,9 @@ pub const TO_ROCOCO_ESTIMATE_MESSAGE_FEE_METHOD: &str =
 	"ToRococoOutboundLaneApi_estimate_message_delivery_and_dispatch_fee";
 /// Name of the `ToRococoOutboundLaneApi::message_details` runtime method.
 pub const TO_ROCOCO_MESSAGE_DETAILS_METHOD: &str = "ToRococoOutboundLaneApi_message_details";
+
+/// Name of the `FromRococoInboundLaneApi::message_details` runtime method.
+pub const FROM_ROCOCO_MESSAGE_DETAILS_METHOD: &str = "FromRococoInboundLaneApi_message_details";
 
 /// Existential deposit on Rococo.
 pub const EXISTENTIAL_DEPOSIT: Balance = 1_000_000_000_000 / 100;
@@ -108,7 +106,7 @@ sp_api::decl_runtime_apis! {
 	/// Rococo runtime itself.
 	pub trait RococoFinalityApi {
 		/// Returns number and hash of the best finalized header known to the bridge module.
-		fn best_finalized() -> (BlockNumber, Hash);
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
 	}
 
 	/// Outbound message lane API for messages that are sent to Rococo chain.
@@ -139,6 +137,21 @@ sp_api::decl_runtime_apis! {
 			lane: LaneId,
 			begin: MessageNonce,
 			end: MessageNonce,
-		) -> Vec<MessageDetails<OutboundMessageFee>>;
+		) -> Vec<OutboundMessageDetails<OutboundMessageFee>>;
+	}
+
+	/// Inbound message lane API for messages sent by Rococo chain.
+	///
+	/// This API is implemented by runtimes that are receiving messages from Rococo chain, not the
+	/// Rococo runtime itself.
+	///
+	/// Entries of the resulting vector are matching entries of the `messages` vector. Entries of the
+	/// `messages` vector may (and need to) be read using `To<ThisChain>OutboundLaneApi::message_details`.
+	pub trait FromRococoInboundLaneApi<InboundMessageFee: Parameter> {
+		/// Return details of given inbound messages.
+		fn message_details(
+			lane: LaneId,
+			messages: Vec<(MessagePayload, OutboundMessageDetails<InboundMessageFee>)>,
+		) -> Vec<InboundMessageDetails>;
 	}
 }

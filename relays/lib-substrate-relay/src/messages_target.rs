@@ -22,10 +22,11 @@ use crate::{
 	messages_lane::{MessageLaneAdapter, ReceiveMessagesProofCallBuilder, SubstrateMessageLane},
 	messages_metrics::StandaloneMessagesMetrics,
 	messages_source::{ensure_messages_pallet_active, read_client_state, SubstrateMessagesProof},
-	on_demand_headers::OnDemandHeadersRelay,
+	on_demand::OnDemandRelay,
 	TransactionParams,
 };
 
+use async_std::sync::Arc;
 use async_trait::async_trait;
 use bp_messages::{
 	storage_keys::inbound_lane_data_key, total_unrewarded_messages, InboundLaneData, LaneId,
@@ -42,7 +43,7 @@ use messages_relay::{
 };
 use num_traits::{Bounded, Zero};
 use relay_substrate_client::{
-	AccountIdOf, AccountKeyPairOf, BalanceOf, Chain, ChainWithMessages, Client,
+	AccountIdOf, AccountKeyPairOf, BalanceOf, BlockNumberOf, Chain, ChainWithMessages, Client,
 	Error as SubstrateError, HashOf, HeaderIdOf, IndexOf, SignParam, TransactionEra,
 	TransactionSignScheme, UnsignedTransaction, WeightToFeeOf,
 };
@@ -63,7 +64,7 @@ pub struct SubstrateMessagesTarget<P: SubstrateMessageLane> {
 	relayer_id_at_source: AccountIdOf<P::SourceChain>,
 	transaction_params: TransactionParams<AccountKeyPairOf<P::TargetTransactionSignScheme>>,
 	metric_values: StandaloneMessagesMetrics<P::SourceChain, P::TargetChain>,
-	source_to_target_headers_relay: Option<OnDemandHeadersRelay<P::SourceChain>>,
+	source_to_target_headers_relay: Option<Arc<dyn OnDemandRelay<BlockNumberOf<P::SourceChain>>>>,
 }
 
 impl<P: SubstrateMessageLane> SubstrateMessagesTarget<P> {
@@ -75,7 +76,9 @@ impl<P: SubstrateMessageLane> SubstrateMessagesTarget<P> {
 		relayer_id_at_source: AccountIdOf<P::SourceChain>,
 		transaction_params: TransactionParams<AccountKeyPairOf<P::TargetTransactionSignScheme>>,
 		metric_values: StandaloneMessagesMetrics<P::SourceChain, P::TargetChain>,
-		source_to_target_headers_relay: Option<OnDemandHeadersRelay<P::SourceChain>>,
+		source_to_target_headers_relay: Option<
+			Arc<dyn OnDemandRelay<BlockNumberOf<P::SourceChain>>>,
+		>,
 	) -> Self {
 		SubstrateMessagesTarget {
 			target_client,
@@ -143,8 +146,12 @@ where
 	BalanceOf<P::SourceChain>: TryFrom<BalanceOf<P::TargetChain>>,
 {
 	async fn state(&self) -> Result<TargetClientState<MessageLaneAdapter<P>>, SubstrateError> {
+		// we can't continue to deliver confirmations if source node is out of sync, because
+		// it may have already received confirmations that we're going to deliver
+		//
 		// we can't continue to deliver messages if target node is out of sync, because
 		// it may have already received (some of) messages that we're going to deliver
+		self.source_client.ensure_synced().await?;
 		self.target_client.ensure_synced().await?;
 		// we can't relay messages if messages pallet at target chain is halted
 		self.ensure_pallet_active().await?;
@@ -188,11 +195,10 @@ where
 		id: TargetHeaderIdOf<MessageLaneAdapter<P>>,
 	) -> Result<(TargetHeaderIdOf<MessageLaneAdapter<P>>, UnrewardedRelayersState), SubstrateError>
 	{
-		let relayers = self
-			.inbound_lane_data(id)
-			.await?
-			.map(|data| data.relayers)
-			.unwrap_or_else(VecDeque::new);
+		let inbound_lane_data = self.inbound_lane_data(id).await?;
+		let last_delivered_nonce =
+			inbound_lane_data.as_ref().map(|data| data.last_delivered_nonce()).unwrap_or(0);
+		let relayers = inbound_lane_data.map(|data| data.relayers).unwrap_or_else(VecDeque::new);
 		let unrewarded_relayers_state = bp_messages::UnrewardedRelayersState {
 			unrewarded_relayer_entries: relayers.len() as _,
 			messages_in_oldest_entry: relayers
@@ -200,6 +206,7 @@ where
 				.map(|entry| 1 + entry.messages.end - entry.messages.begin)
 				.unwrap_or(0),
 			total_messages: total_unrewarded_messages(&relayers).unwrap_or(MessageNonce::MAX),
+			last_delivered_nonce,
 		};
 		Ok((id, unrewarded_relayers_state))
 	}
@@ -269,7 +276,7 @@ where
 
 	async fn require_source_header_on_target(&self, id: SourceHeaderIdOf<MessageLaneAdapter<P>>) {
 		if let Some(ref source_to_target_headers_relay) = self.source_to_target_headers_relay {
-			source_to_target_headers_relay.require_finalized_header(id).await;
+			source_to_target_headers_relay.require_more_headers(id.0).await;
 		}
 	}
 
@@ -515,6 +522,7 @@ fn compute_prepaid_messages_refund<C: ChainWithMessages>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use relay_rialto_client::Rialto;
 	use relay_rococo_client::Rococo;
 	use relay_wococo_client::Wococo;
 
@@ -574,10 +582,10 @@ mod tests {
 	#[test]
 	fn compute_prepaid_messages_refund_returns_sane_results() {
 		assert!(
-			compute_prepaid_messages_refund::<Wococo>(
+			compute_prepaid_messages_refund::<Rialto>(
 				10,
 				FixedU128::saturating_from_rational(110, 100),
-			) > (10 * Wococo::PAY_INBOUND_DISPATCH_FEE_WEIGHT_AT_CHAIN).into()
+			) > (10 * Rialto::PAY_INBOUND_DISPATCH_FEE_WEIGHT_AT_CHAIN).into()
 		);
 	}
 }

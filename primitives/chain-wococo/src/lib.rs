@@ -18,7 +18,9 @@
 // RuntimeApi generated functions
 #![allow(clippy::too_many_arguments)]
 
-use bp_messages::{LaneId, MessageDetails, MessageNonce};
+use bp_messages::{
+	InboundMessageDetails, LaneId, MessageNonce, MessagePayload, OutboundMessageDetails,
+};
 use sp_runtime::FixedU128;
 use sp_std::prelude::*;
 
@@ -36,13 +38,6 @@ pub type Wococo = PolkadotLike;
 /// conditions.
 pub const SESSION_LENGTH: BlockNumber = time_units::MINUTES;
 
-// We use this to get the account on Wococo (target) which is derived from Rococo's (source)
-// account.
-pub fn derive_account_from_rococo_id(id: bp_runtime::SourceAccount<AccountId>) -> AccountId {
-	let encoded_id = bp_runtime::derive_account_id(bp_runtime::ROCOCO_CHAIN_ID, id);
-	AccountIdConverter::convert(encoded_id)
-}
-
 /// Name of the With-Wococo GRANDPA pallet instance that is deployed at bridged chains.
 pub const WITH_WOCOCO_GRANDPA_PALLET_NAME: &str = "BridgeWococoGrandpa";
 /// Name of the With-Wococo messages pallet instance that is deployed at bridged chains.
@@ -58,6 +53,9 @@ pub const TO_WOCOCO_ESTIMATE_MESSAGE_FEE_METHOD: &str =
 /// Name of the `ToWococoOutboundLaneApi::message_details` runtime method.
 pub const TO_WOCOCO_MESSAGE_DETAILS_METHOD: &str = "ToWococoOutboundLaneApi_message_details";
 
+/// Name of the `FromWococoInboundLaneApi::message_details` runtime method.
+pub const FROM_WOCOCO_MESSAGE_DETAILS_METHOD: &str = "FromWococoInboundLaneApi_message_details";
+
 sp_api::decl_runtime_apis! {
 	/// API for querying information about the finalized Wococo headers.
 	///
@@ -65,7 +63,7 @@ sp_api::decl_runtime_apis! {
 	/// Wococo runtime itself.
 	pub trait WococoFinalityApi {
 		/// Returns number and hash of the best finalized header known to the bridge module.
-		fn best_finalized() -> (BlockNumber, Hash);
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
 	}
 
 	/// Outbound message lane API for messages that are sent to Wococo chain.
@@ -96,6 +94,21 @@ sp_api::decl_runtime_apis! {
 			lane: LaneId,
 			begin: MessageNonce,
 			end: MessageNonce,
-		) -> Vec<MessageDetails<OutboundMessageFee>>;
+		) -> Vec<OutboundMessageDetails<OutboundMessageFee>>;
+	}
+
+	/// Inbound message lane API for messages sent by Wococo chain.
+	///
+	/// This API is implemented by runtimes that are receiving messages from Wococo chain, not the
+	/// Wococo runtime itself.
+	///
+	/// Entries of the resulting vector are matching entries of the `messages` vector. Entries of the
+	/// `messages` vector may (and need to) be read using `To<ThisChain>OutboundLaneApi::message_details`.
+	pub trait FromWococoInboundLaneApi<InboundMessageFee: Parameter> {
+		/// Return details of given inbound messages.
+		fn message_details(
+			lane: LaneId,
+			messages: Vec<(MessagePayload, OutboundMessageDetails<InboundMessageFee>)>,
+		) -> Vec<InboundMessageDetails>;
 	}
 }
