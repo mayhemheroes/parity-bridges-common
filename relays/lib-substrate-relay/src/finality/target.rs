@@ -51,12 +51,19 @@ impl<P: SubstrateFinalitySyncPipeline> SubstrateFinalityTarget<P> {
 
 	/// Ensure that the bridge pallet at target chain is active.
 	pub async fn ensure_pallet_active(&self) -> Result<(), Error> {
-		let is_halted = self.client.storage_value(P::FinalityEngine::is_halted_key(), None).await?;
-		if is_halted.unwrap_or(false) {
-			Err(Error::BridgePalletIsHalted)
-		} else {
-			Ok(())
+		let is_halted = P::FinalityEngine::is_halted(&self.client).await?;
+		if is_halted {
+			return Err(Error::BridgePalletIsHalted)
 		}
+
+		let is_initialized = P::FinalityEngine::is_initialized(&self.client)
+			.await
+			.map_err(|e| Error::Custom(e.to_string()))?;
+		if !is_initialized {
+			return Err(Error::BridgePalletIsNotInitialized)
+		}
+
+		Ok(())
 	}
 }
 

@@ -3,7 +3,6 @@ name = "rialto-parachain-collator"
 version = "0.1.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2021"
-homepage = "https://substrate.dev"
 repository = "https://github.com/paritytech/parity-bridges-common/"
 license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
 
@@ -24,6 +23,11 @@ log = '0.4.14'
 codec = { package = 'parity-scale-codec', version = '3.0.0' }
 serde = { version = '1.0', features = ['derive'] }
 hex-literal = '0.3.1'
+
+# Bridge dependencies
+
+bp-rialto-parachain = { path = "../../../primitives/chain-rialto-parachain" }
+pallet-bridge-messages = { path = "../../../modules/messages" }
 
 # RPC related Dependencies
 jsonrpc-core = '18.0'

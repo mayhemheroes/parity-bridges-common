@@ -23,15 +23,18 @@ use crate::{
 		MessageLaneAdapter, ReceiveMessagesDeliveryProofCallBuilder, SubstrateMessageLane,
 	},
 	messages_target::SubstrateMessagesDeliveryProof,
-	on_demand_headers::OnDemandHeadersRelay,
+	on_demand::OnDemandRelay,
 	TransactionParams,
 };
 
+use async_std::sync::Arc;
 use async_trait::async_trait;
 use bp_messages::{
 	storage_keys::{operating_mode_key, outbound_lane_data_key},
-	LaneId, MessageNonce, OperatingMode, OutboundLaneData, UnrewardedRelayersState,
+	InboundMessageDetails, LaneId, MessageData, MessageNonce, MessagesOperatingMode,
+	OutboundLaneData, OutboundMessageDetails, UnrewardedRelayersState,
 };
+use bp_runtime::{messages::DispatchFeePayment, BasicOperatingMode, HeaderIdProvider};
 use bridge_runtime_common::messages::{
 	source::FromBridgedChainMessagesDeliveryProof, target::FromBridgedChainMessagesProof,
 };
@@ -53,7 +56,7 @@ use relay_substrate_client::{
 use relay_utils::{relay_loop::Client as RelayClient, HeaderId};
 use sp_core::{Bytes, Pair};
 use sp_runtime::{traits::Header as HeaderT, DeserializeOwned};
-use std::ops::RangeInclusive;
+use std::{collections::HashMap, ops::RangeInclusive};
 
 /// Intermediate message proof returned by the source Substrate node. Includes everything
 /// required to submit to the target node: cumulative dispatch weight of bundled messages and
@@ -66,7 +69,7 @@ pub struct SubstrateMessagesSource<P: SubstrateMessageLane> {
 	target_client: Client<P::TargetChain>,
 	lane_id: LaneId,
 	transaction_params: TransactionParams<AccountKeyPairOf<P::SourceTransactionSignScheme>>,
-	target_to_source_headers_relay: Option<OnDemandHeadersRelay<P::TargetChain>>,
+	target_to_source_headers_relay: Option<Arc<dyn OnDemandRelay<BlockNumberOf<P::TargetChain>>>>,
 }
 
 impl<P: SubstrateMessageLane> SubstrateMessagesSource<P> {
@@ -76,7 +79,9 @@ impl<P: SubstrateMessageLane> SubstrateMessagesSource<P> {
 		target_client: Client<P::TargetChain>,
 		lane_id: LaneId,
 		transaction_params: TransactionParams<AccountKeyPairOf<P::SourceTransactionSignScheme>>,
-		target_to_source_headers_relay: Option<OnDemandHeadersRelay<P::TargetChain>>,
+		target_to_source_headers_relay: Option<
+			Arc<dyn OnDemandRelay<BlockNumberOf<P::TargetChain>>>,
+		>,
 	) -> Self {
 		SubstrateMessagesSource {
 			source_client,
@@ -141,7 +146,11 @@ where
 	async fn state(&self) -> Result<SourceClientState<MessageLaneAdapter<P>>, SubstrateError> {
 		// we can't continue to deliver confirmations if source node is out of sync, because
 		// it may have already received confirmations that we're going to deliver
+		//
+		// we can't continue to deliver messages if target node is out of sync, because
+		// it may have already received (some of) messages that we're going to deliver
 		self.source_client.ensure_synced().await?;
+		self.target_client.ensure_synced().await?;
 		// we can't relay confirmations if messages pallet at source chain is halted
 		self.ensure_pallet_active().await?;
 
@@ -196,11 +205,97 @@ where
 			)
 			.await?;
 
-		make_message_details_map::<P::SourceChain>(
+		let mut messages = make_message_details_map::<P::SourceChain>(
 			Decode::decode(&mut &encoded_response.0[..])
 				.map_err(SubstrateError::ResponseParseFailed)?,
 			nonces,
-		)
+		)?;
+
+		// prepare arguments of the inbound message details call (if we need it)
+		let mut messages_to_refine = HashMap::new();
+		for (message_nonce, message) in &messages {
+			if message.dispatch_fee_payment != DispatchFeePayment::AtTargetChain {
+				continue
+			}
+
+			// for pay-at-target messages we may want to ask target chain for
+			// refined dispatch weight
+			let message_key = bp_messages::storage_keys::message_key(
+				P::TargetChain::WITH_CHAIN_MESSAGES_PALLET_NAME,
+				&self.lane_id,
+				*message_nonce,
+			);
+			let message_data: MessageData<BalanceOf<P::SourceChain>> =
+				self.source_client.storage_value(message_key, Some(id.1)).await?.ok_or_else(
+					|| {
+						SubstrateError::Custom(format!(
+							"Message to {} {:?}/{} is missing from runtime the storage of {} at {:?}",
+							P::TargetChain::NAME,
+							self.lane_id,
+							message_nonce,
+							P::SourceChain::NAME,
+							id,
+						))
+					},
+				)?;
+			let message_payload = message_data.payload;
+			messages_to_refine.insert(
+				*message_nonce,
+				(
+					message_payload,
+					OutboundMessageDetails {
+						nonce: *message_nonce,
+						dispatch_weight: message.dispatch_weight,
+						size: message.size,
+						delivery_and_dispatch_fee: message.reward,
+						dispatch_fee_payment: DispatchFeePayment::AtTargetChain,
+					},
+				),
+			);
+		}
+
+		// request inbound message details from the target client
+		if !messages_to_refine.is_empty() {
+			let refined_messages_encoded = self
+				.target_client
+				.state_call(
+					P::SourceChain::FROM_CHAIN_MESSAGE_DETAILS_METHOD.into(),
+					Bytes((self.lane_id, messages_to_refine.values().collect::<Vec<_>>()).encode()),
+					None,
+				)
+				.await?;
+			let refined_messages =
+				Vec::<InboundMessageDetails>::decode(&mut &refined_messages_encoded.0[..])
+					.map_err(SubstrateError::ResponseParseFailed)?;
+			if refined_messages.len() != messages_to_refine.len() {
+				return Err(SubstrateError::Custom(format!(
+					"Call of {} at {} has returned {} entries instead of expected {}",
+					P::SourceChain::FROM_CHAIN_MESSAGE_DETAILS_METHOD,
+					P::TargetChain::NAME,
+					refined_messages.len(),
+					messages_to_refine.len(),
+				)))
+			}
+
+			for (nonce, refined_message) in messages_to_refine.keys().zip(refined_messages) {
+				let message = messages
+					.get_mut(nonce)
+					.expect("`messages_to_refine` is a subset of `messages`; qed");
+				log::trace!(
+					target: "bridge",
+					"Refined weight of {}->{} message {:?}/{}: at-source: {}, at-target: {}",
+					P::SourceChain::NAME,
+					P::TargetChain::NAME,
+					self.lane_id,
+					nonce,
+					message.dispatch_weight,
+					refined_message.dispatch_weight,
+				);
+				message.dispatch_weight = refined_message.dispatch_weight;
+			}
+		}
+
+		Ok(messages)
 	}
 
 	async fn prove_messages(
@@ -282,7 +377,7 @@ where
 
 	async fn require_target_header_on_source(&self, id: TargetHeaderIdOf<MessageLaneAdapter<P>>) {
 		if let Some(ref target_to_source_headers_relay) = self.target_to_source_headers_relay {
-			target_to_source_headers_relay.require_finalized_header(id).await;
+			target_to_source_headers_relay.require_more_headers(id.0).await;
 		}
 	}
 
@@ -325,7 +420,8 @@ where
 	let operating_mode = client
 		.storage_value(operating_mode_key(WithChain::WITH_CHAIN_MESSAGES_PALLET_NAME), None)
 		.await?;
-	let is_halted = operating_mode == Some(OperatingMode::Halted);
+	let is_halted =
+		operating_mode == Some(MessagesOperatingMode::Basic(BasicOperatingMode::Halted));
 	if is_halted {
 		Err(SubstrateError::BridgePalletIsHalted)
 	} else {
@@ -371,18 +467,15 @@ where
 /// affect the call weight - we only care about its size.
 fn prepare_dummy_messages_delivery_proof<SC: Chain, TC: Chain>(
 ) -> SubstrateMessagesDeliveryProof<TC> {
-	let single_message_confirmation_size = bp_messages::InboundLaneData::<()>::encoded_size_hint(
-		SC::MAXIMAL_ENCODED_ACCOUNT_ID_SIZE,
-		1,
-		1,
-	)
-	.unwrap_or(u32::MAX);
+	let single_message_confirmation_size =
+		bp_messages::InboundLaneData::<()>::encoded_size_hint_u32(1, 1);
 	let proof_size = TC::STORAGE_PROOF_OVERHEAD.saturating_add(single_message_confirmation_size);
 	(
 		UnrewardedRelayersState {
 			unrewarded_relayer_entries: 1,
 			messages_in_oldest_entry: 1,
 			total_messages: 1,
+			last_delivered_nonce: 1,
 		},
 		FromBridgedChainMessagesDeliveryProof {
 			bridged_header_hash: Default::default(),
@@ -415,34 +508,28 @@ where
 	let self_best_finalized_header_hash = self_client.best_finalized_header_hash().await?;
 	let self_best_finalized_header =
 		self_client.header_by_hash(self_best_finalized_header_hash).await?;
-	let self_best_finalized_id =
-		HeaderId(*self_best_finalized_header.number(), self_best_finalized_header_hash);
+	let self_best_finalized_id = self_best_finalized_header.id();
 
 	// now let's read our best header on **this** chain
 	let self_best_header = self_client.best_header().await?;
 	let self_best_hash = self_best_header.hash();
-	let self_best_id = HeaderId(*self_best_header.number(), self_best_hash);
+	let self_best_id = self_best_header.id();
 
 	// now let's read id of best finalized peer header at our best finalized block
-	let encoded_best_finalized_peer_on_self = self_client
-		.state_call(
-			best_finalized_header_id_method_name.into(),
-			Bytes(Vec::new()),
-			Some(self_best_hash),
+	let peer_on_self_best_finalized_id =
+		best_finalized_peer_header_at_self::<SelfChain, PeerChain>(
+			self_client,
+			self_best_hash,
+			best_finalized_header_id_method_name,
 		)
 		.await?;
-	let decoded_best_finalized_peer_on_self: (BlockNumberOf<PeerChain>, HashOf<PeerChain>) =
-		Decode::decode(&mut &encoded_best_finalized_peer_on_self.0[..])
-			.map_err(SubstrateError::ResponseParseFailed)?;
-	let peer_on_self_best_finalized_id =
-		HeaderId(decoded_best_finalized_peer_on_self.0, decoded_best_finalized_peer_on_self.1);
 
 	// read actual header, matching the `peer_on_self_best_finalized_id` from the peer chain
 	let actual_peer_on_self_best_finalized_id = match peer_client {
 		Some(peer_client) => {
 			let actual_peer_on_self_best_finalized =
 				peer_client.header_by_number(peer_on_self_best_finalized_id.0).await?;
-			HeaderId(peer_on_self_best_finalized_id.0, actual_peer_on_self_best_finalized.hash())
+			actual_peer_on_self_best_finalized.id()
 		},
 		None => peer_on_self_best_finalized_id,
 	};
@@ -455,8 +542,41 @@ where
 	})
 }
 
+/// Reads best `PeerChain` header known to the `SelfChain` using provided runtime API method.
+///
+/// Method is supposed to be the `<PeerChain>FinalityApi::best_finalized()` method.
+pub async fn best_finalized_peer_header_at_self<SelfChain, PeerChain>(
+	self_client: &Client<SelfChain>,
+	at_self_hash: HashOf<SelfChain>,
+	best_finalized_header_id_method_name: &str,
+) -> Result<HeaderIdOf<PeerChain>, SubstrateError>
+where
+	SelfChain: Chain,
+	PeerChain: Chain,
+{
+	// now let's read id of best finalized peer header at our best finalized block
+	let encoded_best_finalized_peer_on_self = self_client
+		.state_call(
+			best_finalized_header_id_method_name.into(),
+			Bytes(Vec::new()),
+			Some(at_self_hash),
+		)
+		.await?;
+	let decoded_best_finalized_peer_on_self =
+		Option::<(BlockNumberOf<PeerChain>, HashOf<PeerChain>)>::decode(
+			&mut &encoded_best_finalized_peer_on_self.0[..],
+		)
+		.map_err(SubstrateError::ResponseParseFailed)?
+		.map(Ok)
+		.unwrap_or(Err(SubstrateError::BridgePalletIsNotInitialized))?;
+	let peer_on_self_best_finalized_id =
+		HeaderId(decoded_best_finalized_peer_on_self.0, decoded_best_finalized_peer_on_self.1);
+
+	Ok(peer_on_self_best_finalized_id)
+}
+
 fn make_message_details_map<C: Chain>(
-	weights: Vec<bp_messages::MessageDetails<C::Balance>>,
+	weights: Vec<bp_messages::OutboundMessageDetails<C::Balance>>,
 	nonces: RangeInclusive<MessageNonce>,
 ) -> Result<MessageDetailsMap<C::Balance>, SubstrateError> {
 	let make_missing_nonce_error = |expected_nonce| {
@@ -526,15 +646,16 @@ fn make_message_details_map<C: Chain>(
 mod tests {
 	use super::*;
 	use bp_runtime::messages::DispatchFeePayment;
+	use codec::MaxEncodedLen;
 	use relay_rococo_client::Rococo;
 	use relay_wococo_client::Wococo;
 
 	fn message_details_from_rpc(
 		nonces: RangeInclusive<MessageNonce>,
-	) -> Vec<bp_messages::MessageDetails<bp_wococo::Balance>> {
+	) -> Vec<bp_messages::OutboundMessageDetails<bp_wococo::Balance>> {
 		nonces
 			.into_iter()
-			.map(|nonce| bp_messages::MessageDetails {
+			.map(|nonce| bp_messages::OutboundMessageDetails {
 				nonce,
 				dispatch_weight: 0,
 				size: 0,
@@ -640,7 +761,7 @@ mod tests {
 	#[test]
 	fn prepare_dummy_messages_delivery_proof_works() {
 		let expected_minimal_size =
-			Wococo::MAXIMAL_ENCODED_ACCOUNT_ID_SIZE + Rococo::STORAGE_PROOF_OVERHEAD;
+			bp_wococo::AccountId::max_encoded_len() as u32 + Rococo::STORAGE_PROOF_OVERHEAD;
 		let dummy_proof = prepare_dummy_messages_delivery_proof::<Wococo, Rococo>();
 		assert!(
 			dummy_proof.1.encode().len() as u32 > expected_minimal_size,

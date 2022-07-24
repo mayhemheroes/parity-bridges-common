@@ -65,11 +65,6 @@ pub mod parachains;
 /// at next runtime upgrade.
 pub const EXTRA_STORAGE_PROOF_SIZE: u32 = 1024;
 
-/// Maximal size (in bytes) of encoded (using `Encode::encode()`) account id.
-///
-/// All polkadot-like chains are using same crypto.
-pub const MAXIMAL_ENCODED_ACCOUNT_ID_SIZE: u32 = 32;
-
 /// All Polkadot-like chains allow normal extrinsics to fill block up to 75 percent.
 ///
 /// This is a copy-paste from the Polkadot repo's `polkadot-runtime-common` crate.
@@ -395,15 +390,6 @@ impl Chain for PolkadotLike {
 	}
 }
 
-/// Convert a 256-bit hash into an AccountId.
-pub struct AccountIdConverter;
-
-impl Convert<sp_core::H256, AccountId> for AccountIdConverter {
-	fn convert(hash: sp_core::H256) -> AccountId {
-		hash.to_fixed_bytes().into()
-	}
-}
-
 /// Return a storage key for account data.
 ///
 /// This is based on FRAME storage-generation code from Substrate:
@@ -429,18 +415,6 @@ pub fn account_info_storage_key(id: &AccountId) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use sp_runtime::codec::Encode;
-
-	#[test]
-	fn maximal_encoded_account_id_size_is_correct() {
-		let actual_size = AccountId::from([0u8; 32]).encode().len();
-		assert!(
-			actual_size <= MAXIMAL_ENCODED_ACCOUNT_ID_SIZE as usize,
-			"Actual size of encoded account id for Polkadot-like chains ({}) is larger than expected {}",
-			actual_size,
-			MAXIMAL_ENCODED_ACCOUNT_ID_SIZE,
-		);
-	}
 
 	#[test]
 	fn should_generate_storage_key() {

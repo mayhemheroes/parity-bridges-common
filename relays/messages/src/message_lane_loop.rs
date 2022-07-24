@@ -62,7 +62,7 @@ pub struct Params<Strategy: RelayStrategy> {
 }
 
 /// Relayer operating mode.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayerMode {
 	/// The relayer doesn't care about rewards.
 	Altruistic,
@@ -111,7 +111,7 @@ pub type MessageDetailsMap<SourceChainBalance> =
 	BTreeMap<MessageNonce, MessageDetails<SourceChainBalance>>;
 
 /// Message delivery race proof parameters.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MessageProofParameters {
 	/// Include outbound lane state proof?
 	pub outbound_state_proof_required: bool,
@@ -729,6 +729,7 @@ pub(crate) mod tests {
 					unrewarded_relayer_entries: 0,
 					messages_in_oldest_entry: 0,
 					total_messages: 0,
+					last_delivered_nonce: 0,
 				},
 			))
 		}

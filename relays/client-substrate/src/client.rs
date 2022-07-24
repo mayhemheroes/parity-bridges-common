@@ -25,6 +25,7 @@ use crate::{
 
 use async_std::sync::{Arc, Mutex};
 use async_trait::async_trait;
+use bp_runtime::HeaderIdProvider;
 use codec::{Decode, Encode};
 use frame_system::AccountInfo;
 use futures::{SinkExt, StreamExt};
@@ -33,10 +34,10 @@ use jsonrpsee::{
 	types::params::ParamsSer,
 	ws_client::{WsClient as RpcClient, WsClientBuilder as RpcClientBuilder},
 };
-use num_traits::{Bounded, CheckedSub, One, Zero};
+use num_traits::{Bounded, Zero};
 use pallet_balances::AccountData;
 use pallet_transaction_payment::InclusionFee;
-use relay_utils::{relay_loop::RECONNECT_DELAY, HeaderId};
+use relay_utils::relay_loop::RECONNECT_DELAY;
 use sp_core::{
 	storage::{StorageData, StorageKey},
 	Bytes, Hasher,
@@ -187,6 +188,8 @@ impl<C: Chain> Client<C> {
 			params.host,
 			params.port,
 		);
+		log::info!(target: "bridge", "Connecting to {} node at {}", C::NAME, uri);
+
 		let client = tokio
 			.spawn(async move {
 				RpcClientBuilder::default()
@@ -260,6 +263,11 @@ impl<C: Chain> Client<C> {
 	/// Return number of the best finalized block.
 	pub async fn best_finalized_header_number(&self) -> Result<C::BlockNumber> {
 		Ok(*self.header_by_hash(self.best_finalized_header_hash().await?).await?.number())
+	}
+
+	/// Return header of the best finalized block.
+	pub async fn best_finalized_header(&self) -> Result<C::Header> {
+		self.header_by_hash(self.best_finalized_header_hash().await?).await
 	}
 
 	/// Returns the best Substrate header.
@@ -449,8 +457,12 @@ impl<C: Chain> Client<C> {
 				IndexOf<C>,
 				C::SignedBlock,
 			>::author_submit_extrinsic(&*client, transaction)
-			.await?;
-			log::trace!(target: "bridge", "Sent transaction to Substrate node: {:?}", tx_hash);
+			.await
+			.map_err(|e| {
+				log::error!(target: "bridge", "Failed to send transaction to {} node: {:?}", C::NAME, e);
+				e
+			})?;
+			log::trace!(target: "bridge", "Sent transaction to {} node: {:?}", C::NAME, tx_hash);
 			Ok(tx_hash)
 		})
 		.await
@@ -473,14 +485,11 @@ impl<C: Chain> Client<C> {
 		let best_header = self.best_header().await?;
 
 		// By using parent of best block here, we are protecing again best-block reorganizations.
-		// E.g. transaction my have been submitted when the best block was `A[num=100]`. Then it has
-		// been changed to `B[num=100]`. Hash of `A` has been included into transaction signature
-		// payload. So when signature will be checked, the check will fail and transaction will be
-		// dropped from the pool.
-		let best_header_id = match best_header.number().checked_sub(&One::one()) {
-			Some(parent_block_number) => HeaderId(parent_block_number, *best_header.parent_hash()),
-			None => HeaderId(*best_header.number(), best_header.hash()),
-		};
+		// E.g. transaction may have been submitted when the best block was `A[num=100]`. Then it
+		// has been changed to `B[num=100]`. Hash of `A` has been included into transaction
+		// signature payload. So when signature will be checked, the check will fail and transaction
+		// will be dropped from the pool.
+		let best_header_id = best_header.parent_id().unwrap_or_else(|| best_header.id());
 
 		self.jsonrpsee_execute(move |client| async move {
 			let extrinsic = prepare_extrinsic(best_header_id, transaction_nonce)?;
@@ -492,7 +501,11 @@ impl<C: Chain> Client<C> {
 				IndexOf<C>,
 				C::SignedBlock,
 			>::author_submit_extrinsic(&*client, extrinsic)
-			.await?;
+			.await
+			.map_err(|e| {
+				log::error!(target: "bridge", "Failed to send transaction to {} node: {:?}", C::NAME, e);
+				e
+			})?;
 			log::trace!(target: "bridge", "Sent transaction to {} node: {:?}", C::NAME, tx_hash);
 			Ok(tx_hash)
 		})
@@ -509,7 +522,7 @@ impl<C: Chain> Client<C> {
 		let _guard = self.submit_signed_extrinsic_lock.lock().await;
 		let transaction_nonce = self.next_account_index(extrinsic_signer).await?;
 		let best_header = self.best_header().await?;
-		let best_header_id = HeaderId(*best_header.number(), best_header.hash());
+		let best_header_id = best_header.id();
 		let subscription = self
 			.jsonrpsee_execute(move |client| async move {
 				let extrinsic = prepare_extrinsic(best_header_id, transaction_nonce)?;
@@ -521,7 +534,11 @@ impl<C: Chain> Client<C> {
 							.map_err(|e| Error::RpcError(e.into()))?])),
 						"author_unwatchExtrinsic",
 					)
-					.await?;
+					.await
+					.map_err(|e| {
+						log::error!(target: "bridge", "Failed to send transaction to {} node: {:?}", C::NAME, e);
+						e
+					})?;
 				log::trace!(target: "bridge", "Sent transaction to {} node: {:?}", C::NAME, tx_hash);
 				Ok(subscription)
 			})
@@ -736,6 +753,15 @@ impl<C: Chain> Client<C> {
 	{
 		let client = self.client.clone();
 		self.tokio.spawn(async move { make_jsonrpsee_future(client).await }).await?
+	}
+
+	/// Returns `true` if version guard can be started.
+	///
+	/// There's no reason to run version guard when version mode is set to `Auto`. It can
+	/// lead to relay shutdown when chain is upgraded, even though we have explicitly
+	/// said that we don't want to shutdown.
+	pub fn can_start_version_guard(&self) -> bool {
+		!matches!(self.chain_runtime_version, ChainRuntimeVersion::Auto)
 	}
 }
 

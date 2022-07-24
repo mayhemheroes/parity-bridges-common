@@ -79,15 +79,13 @@ impl sp_runtime::traits::Dispatchable for Call {
 	}
 }
 
-// We use this to get the account on Westend (target) which is derived from Rococo's (source)
-// account.
-pub fn derive_account_from_rococo_id(id: bp_runtime::SourceAccount<AccountId>) -> AccountId {
-	let encoded_id = bp_runtime::derive_account_id(bp_runtime::ROCOCO_CHAIN_ID, id);
-	AccountIdConverter::convert(encoded_id)
-}
+/// Name of the parachains pallet at the Westend runtime.
+pub const PARAS_PALLET_NAME: &str = "Paras";
 
 /// Name of the With-Westend GRANDPA pallet instance that is deployed at bridged chains.
 pub const WITH_WESTEND_GRANDPA_PALLET_NAME: &str = "BridgeWestendGrandpa";
+/// Name of the With-Westend parachains bridge pallet instance that is deployed at bridged chains.
+pub const WITH_WESTEND_BRIDGE_PARAS_PALLET_NAME: &str = "BridgeWestendParachains";
 
 /// Name of the `WestendFinalityApi::best_finalized` runtime method.
 pub const BEST_FINALIZED_WESTEND_HEADER_METHOD: &str = "WestendFinalityApi_best_finalized";
@@ -106,6 +104,21 @@ sp_api::decl_runtime_apis! {
 	/// Westend runtime itself.
 	pub trait WestendFinalityApi {
 		/// Returns number and hash of the best finalized header known to the bridge module.
-		fn best_finalized() -> (BlockNumber, Hash);
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
+	}
+
+	/// API for querying information about the finalized Westmint headers.
+	///
+	/// This API is implemented by runtimes that are bridging with the Westmint chain, not the
+	/// Westmint runtime itself.
+	pub trait WestmintFinalityApi {
+		/// Returns number and hash of the best finalized header known to the bridge module.
+		fn best_finalized() -> Option<(BlockNumber, Hash)>;
 	}
 }
+
+/// Identifier of Westmint parachain at the Westend relay chain.
+pub const WESTMINT_PARACHAIN_ID: u32 = 2000;
+
+/// Name of the `WestmintFinalityApi::best_finalized` runtime method.
+pub const BEST_FINALIZED_WESTMINT_HEADER_METHOD: &str = "WestmintFinalityApi_best_finalized";

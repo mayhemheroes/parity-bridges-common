@@ -52,8 +52,6 @@ pub trait Chain: ChainBase + Clone {
 	const AVERAGE_BLOCK_INTERVAL: Duration;
 	/// Maximal expected storage proof overhead (in bytes).
 	const STORAGE_PROOF_OVERHEAD: u32;
-	/// Maximal size (in bytes) of SCALE-encoded account id on this chain.
-	const MAXIMAL_ENCODED_ACCOUNT_ID_SIZE: u32;
 
 	/// Block type.
 	type SignedBlock: Member + Serialize + DeserializeOwned + BlockWithJustification<Self::Header>;
@@ -62,6 +60,20 @@ pub trait Chain: ChainBase + Clone {
 
 	/// Type that is used by the chain, to convert from weight to fee.
 	type WeightToFee: WeightToFeePolynomial<Balance = Self::Balance>;
+}
+
+/// Substrate-based relay chain that supports parachains.
+///
+/// We assume that the parachains are supported using `runtime_parachains::paras` pallet.
+pub trait RelayChain: Chain {
+	/// Name of the `runtime_parachains::paras` pallet in the runtime of this chain.
+	const PARAS_PALLET_NAME: &'static str;
+	/// Name of the bridge parachains pallet (used in `construct_runtime` macro call) that is
+	/// deployed at the **bridged** chain.
+	///
+	/// We assume that all chains that are bridging with this `ChainWithGrandpa` are using
+	/// the same name.
+	const PARACHAINS_FINALITY_PALLET_NAME: &'static str;
 }
 
 /// Substrate-based chain that is using direct GRANDPA finality from minimal relay-client point of
@@ -90,6 +102,10 @@ pub trait ChainWithMessages: Chain {
 	/// Name of the `To<ChainWithMessages>OutboundLaneApi::message_details` runtime API method.
 	/// The method is provided by the runtime that is bridged with this `ChainWithMessages`.
 	const TO_CHAIN_MESSAGE_DETAILS_METHOD: &'static str;
+
+	/// Name of the `From<ChainWithMessages>InboundLaneApi::message_details` runtime API method.
+	/// The method is provided by the runtime that is bridged with this `ChainWithMessages`.
+	const FROM_CHAIN_MESSAGE_DETAILS_METHOD: &'static str;
 
 	/// Additional weight of the dispatch fee payment if dispatch is paid at the target chain
 	/// and this `ChainWithMessages` is the target chain.
